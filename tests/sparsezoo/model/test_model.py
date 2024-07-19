@@ -15,6 +15,7 @@
 import copy
 import os
 import shutil
+import tarfile
 import tempfile
 from pathlib import Path
 
@@ -26,23 +27,26 @@ from sparsezoo import Model
 
 files_ic = {
     "training",
+    "deployment.tar.gz",
     "deployment",
     "logs",
     "onnx",
     "model.onnx",
-    "recipe",
-    "sample_inputs.tar.gz",
-    "sample_originals.tar.gz",
-    "sample_labels.tar.gz",
-    "sample_outputs.tar.gz",
-    "sample_inputs",
-    "sample_originals",
-    "sample_labels",
-    "sample_outputs",
+    "model.onnx.tar.gz",
+    "sample-inputs.tar.gz",
+    "sample-originals.tar.gz",
+    "sample-labels.tar.gz",
+    "sample-outputs.tar.gz",
+    "sample-inputs",
+    "sample-originals",
+    "sample-labels",
+    "sample-outputs",
     "benchmarks.yaml",
+    "benchmark.yaml",
     "eval.yaml",
     "analysis.yaml",
     "model.md",
+    "metrics.yaml",
 }
 
 files_nlp = copy.copy(files_ic)
@@ -82,23 +86,29 @@ files_yolo = copy.copy(files_ic)
             ("checkpoint", "postqat"),
             True,
         ),
+        (
+            "biobert-base_cased-jnlpba_pubmed-pruned80.4block_quantized",
+            ("deployment", "default"),
+            True,
+        ),
+        (
+            "resnet_v1-50-imagenet-pruned95",
+            ("checkpoint", "preqat"),
+            True,
+        ),
     ],
     scope="function",
 )
 class TestSetupModel:
     @pytest.fixture()
-    def setup(self, stub, args, should_pass):
-        temp_dir = tempfile.TemporaryDirectory(dir="/tmp")
+    def setup(self, stub, args, should_pass, tmpdir):
+        yield stub, args, should_pass, tmpdir
 
-        yield stub, args, should_pass
-
-        shutil.rmtree(temp_dir.name)
-
-    def test_model_from_stub(self, stub, args, should_pass):
-        temp_dir = tempfile.TemporaryDirectory(dir="/tmp")
+    def test_model_from_stub(self, setup):
+        stub, args, should_pass, tmpdir = setup
         path = stub + "?" + args[0] + "=" + args[1]
         if should_pass:
-            model = Model(path, temp_dir.name)
+            model = Model(path, tmpdir)
             self._assert_correct_files_downloaded(model, args)
             self._assert_validation_results_exist(model)
             assert model.compressed_size
@@ -108,9 +118,7 @@ class TestSetupModel:
 
     @staticmethod
     def _assert_correct_files_downloaded(model, args):
-        if args[0] == "recipe":
-            assert len(model.recipes.available) == 1
-        elif args[0] == "checkpoint":
+        if args[0] == "checkpoint":
             assert len(model.training.available) == 1
         elif args[0] == "deployment":
             assert len(model.training.available) == 1
@@ -127,19 +135,46 @@ class TestSetupModel:
     "stub, clone_sample_outputs, expected_files",
     [
         (
-            "zoo:cv/classification/mobilenet_v1-1.0/pytorch/sparseml/imagenet/pruned-moderate",  # noqa E501
+            (
+                "zoo:"
+                "cv/classification/mobilenet_v1-1.0/"
+                "pytorch/sparseml/imagenet/pruned-moderate"
+            ),
             True,
-            files_ic,
+            files_ic.union({"recipe.md", "recipe_transfer_learn.md"}),
         ),
         (
-            "zoo:nlp/question_answering/distilbert-none/pytorch/huggingface/squad/pruned80_quant-none-vnni",  # noqa E501
+            (
+                "zoo:"
+                "nlp/question_answering/distilbert-none/"
+                "pytorch/huggingface/squad/pruned80_quant-none-vnni"
+            ),
             False,
-            files_nlp,
+            files_nlp.union({"recipe.md"}),
         ),
         (
-            "zoo:cv/detection/yolov5-s/pytorch/ultralytics/coco/pruned_quant-aggressive_94",  # noqa E501
+            (
+                "zoo:"
+                "cv/detection/yolov5-s/"
+                "pytorch/ultralytics/coco/pruned_quant-aggressive_94"
+            ),
             True,
-            files_yolo,
+            files_yolo.union({"recipe.md", "recipe_transfer_learn.md"}),
+        ),
+        (
+            "yolov5-x-coco-pruned70.4block_quantized",
+            False,
+            files_yolo.union({"recipe.md", "recipe_transfer_learn.md"}),
+        ),
+        (
+            "yolov5-n6-voc_coco-pruned55",
+            False,
+            files_yolo.union({"recipe.md"}),
+        ),
+        (
+            "resnet_v1-50-imagenet-channel30_pruned90_quantized",
+            False,
+            files_yolo.union({"recipe.md", "recipe_transfer_classification.md"}),
         ),
     ],
     scope="function",
@@ -161,8 +196,8 @@ class TestModel:
         _, clone_sample_outputs, expected_files, temp_dir = setup
         if clone_sample_outputs:
             for file_name in [
-                "sample_outputs_onnxruntime",
-                "sample_outputs_deepsparse",
+                "sample-outputs_onnxruntime",
+                "sample-outputs_deepsparse",
             ]:
                 expected_files.update({file_name, file_name + ".tar.gz"})
         assert not set(os.listdir(temp_dir.name)).difference(expected_files)
@@ -190,7 +225,7 @@ class TestModel:
         os.makedirs(onnx_folder_dir)
         for opset in range(1, 3):
             shutil.copyfile(
-                os.path.join(directory_path, "model.onnx"),
+                os.path.join(directory_path, "deployment", "model.onnx"),
                 os.path.join(onnx_folder_dir, f"model.{opset}.onnx"),
             )
 
@@ -210,19 +245,19 @@ class TestModel:
             )
             Path(optional_recipe_yaml).touch()
 
-        # add remaining `sample_{...}` files, that may be potentially
+        # add remaining `sample-{...}` files, that may be potentially
         # missing
-        mock_sample_file = os.path.join(directory_path, "sample_inputs.tar.gz")
-        for file_name in ["sample_originals.tar.gz", "sample_labels.tar.gz"]:
+        mock_sample_file = os.path.join(directory_path, "sample-inputs.tar.gz")
+        for file_name in ["sample-originals.tar.gz", "sample-labels.tar.gz"]:
             expected_file_dir = os.path.join(directory_path, file_name)
             if not os.path.isfile(expected_file_dir):
                 shutil.copyfile(mock_sample_file, expected_file_dir)
 
         if clone_sample_outputs:
-            sample_outputs_file = os.path.join(directory_path, "sample_outputs.tar.gz")
+            sample_outputs_file = os.path.join(directory_path, "sample-outputs.tar.gz")
             for file_name in [
-                "sample_outputs_onnxruntime.tar.gz",
-                "sample_outputs_deepsparse.tar.gz",
+                "sample-outputs_onnxruntime.tar.gz",
+                "sample-outputs_deepsparse.tar.gz",
             ]:
                 shutil.copyfile(
                     sample_outputs_file, os.path.join(directory_path, file_name)
@@ -235,12 +270,11 @@ class TestModel:
         if engine == "onnxruntime":
             # test whether the functionality saves the numpy files to tar properly
             tar_file_expected_path = os.path.join(
-                directory_path, f"sample_outputs_{engine}.tar.gz"
+                directory_path, f"sample-outputs_{engine}.tar.gz"
             )
             if os.path.isfile(tar_file_expected_path):
                 os.remove(tar_file_expected_path)
             save_to_tar = True
-
         output_expected = next(iter(model_directory.sample_outputs[engine]))
         output_expected = list(output_expected.values())
         output = next(
@@ -263,3 +297,64 @@ class TestModel:
 
         if engine == "onnxruntime":
             assert os.path.isfile(tar_file_expected_path)
+
+
+@pytest.mark.parametrize(
+    "stub",
+    [
+        "zoo:cv/classification/mobilenet_v1-1.0/pytorch/sparseml/"
+        "imagenet/pruned-moderate",
+    ],
+)
+def test_model_gz_extraction_from_stub(stub: str):
+    temp_dir = tempfile.TemporaryDirectory(dir="/tmp")
+
+    model = Model(stub, temp_dir.name)
+    _extraction_test_helper(model)
+    shutil.rmtree(temp_dir.name)
+
+
+@pytest.mark.parametrize(
+    "stub",
+    [
+        "zoo:cv/classification/mobilenet_v1-1.0/pytorch/sparseml/"
+        "imagenet/pruned-moderate",
+    ],
+)
+def test_model_gz_extraction_from_local_files(stub: str):
+    temp_dir = tempfile.TemporaryDirectory(dir="/tmp")
+    model = Model(stub, temp_dir.name)
+    model.download()
+
+    source = temp_dir.name
+    model_from_local_files = Model(source)
+    _extraction_test_helper(model_from_local_files)
+    shutil.rmtree(temp_dir.name)
+
+
+@pytest.mark.parametrize(
+    "stub",
+    [
+        "zoo:cv/classification/mobilenet_v1-1.0/pytorch/sparseml/"
+        "imagenet/pruned-moderate",
+    ],
+)
+def _extraction_test_helper(model: Model):
+    # download and extract model.onnx.tar.gz
+    #  path should point to extracted model.onnx file
+    path = Path(model.onnx_model.path)
+
+    # assert path points to model.onnx file
+    assert path.exists(), f"{path} does not exist"
+    assert path.is_file(), f"{path} is not a file"
+
+    # assert model.onnx.tar.gz exists
+    model_gz_path = path.with_name("model.onnx.tar.gz")
+    assert model_gz_path.exists(), f"{model_gz_path} does not exist"
+
+    # assert all members of  model.onnx.tar.gz have been extracted
+    for zipped_filename in tarfile.open(model_gz_path).getnames():
+        unzipped_file_path = path.with_name(zipped_filename)
+        assert (
+            unzipped_file_path.exists()
+        ), f"{unzipped_file_path} does not exist, was it extracted?"

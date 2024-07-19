@@ -12,22 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import copy
 import logging
 import os
+import re
 import shutil
+import tarfile
 import warnings
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
+from sparsezoo.api.graphql import GraphQLAPI
 from sparsezoo.model.result_utils import (
     ModelResult,
     ThroughputResults,
     ValidationResult,
 )
-from sparsezoo.objects import Directory, File, NumpyDirectory
-from sparsezoo.utils import download_get_request, save_numpy
+from sparsezoo.objects import Directory, File, NumpyDirectory, OnnxGz, Recipes
+from sparsezoo.utils import convert_to_bool, save_numpy
 
 
 __all__ = [
@@ -39,6 +43,7 @@ __all__ = [
     "ZOO_STUB_PREFIX",
     "SAVE_DIR",
     "COMPRESSED_FILE_NAME",
+    "get_model_metadata_from_stub",
 ]
 
 ALLOWED_FILE_TYPES = {
@@ -53,6 +58,8 @@ ALLOWED_FILE_TYPES = {
     "benchmarking",
     "outputs",
     "onnx_gz",
+    "benchmark",
+    "metrics",
 }
 
 _LOGGER = logging.getLogger(__name__)
@@ -61,6 +68,26 @@ ZOO_STUB_PREFIX = "zoo:"
 CACHE_DIR = os.path.expanduser(os.path.join("~", ".cache", "sparsezoo"))
 SAVE_DIR = os.getenv("SPARSEZOO_MODELS_PATH", CACHE_DIR)
 COMPRESSED_FILE_NAME = "model.onnx.tar.gz"
+
+STUB_V1_REGEX_EXPR = (
+    r"^(zoo:)?"
+    r"(?P<domain>[\.A-z0-9_]+)"
+    r"/(?P<sub_domain>[\.A-z0-9_]+)"
+    r"/(?P<architecture>[\.A-z0-9_]+)(-(?P<sub_architecture>[\.A-z0-9_]+))?"
+    r"/(?P<framework>[\.A-z0-9_]+)"
+    r"/(?P<repo>[\.A-z0-9_]+)"
+    r"/(?P<dataset>[\.A-z0-9_]+)(-(?P<training_scheme>[\.A-z0-9_]+))?"
+    r"/(?P<sparse_tag>[\.A-z0-9_-]+)"
+)
+
+STUB_V2_REGEX_EXPR = (
+    r"^(zoo:)?"
+    r"(?P<architecture>[\.A-z0-9_]+)"
+    r"(-(?P<sub_architecture>[\.A-z0-9_]+))?"
+    r"-(?P<source_dataset>[\.A-z0-9_]+)"
+    r"(-(?P<training_dataset>[\.A-z0-9_]+))?"
+    r"-(?P<sparse_tag>[\.A-z0-9_]+)"
+)
 
 
 def load_files_from_directory(directory_path: str) -> List[Dict[str, Any]]:
@@ -82,28 +109,11 @@ def load_files_from_directory(directory_path: str) -> List[Dict[str, Any]]:
     return files
 
 
-def _get_compressed_size(files: List[Dict[str, Any]]) -> Optional[int]:
-    """
-    Utility method to return compressed file size in bytes, if the size cannot
-    be inferred `None` is returned
-
-    :param files: List of file dictionaries
-    :return: `None` if file size cannot be determined, else an int representing
-        compressed size of the model in bytes
-    """
-    for file in files:
-        if file.get("display_name") == COMPRESSED_FILE_NAME:
-            return file.get("file_size")
-
-    _LOGGER.info("Compressed file-size not found!")
-
-
 def load_files_from_stub(
     stub: str,
     valid_params: Optional[List[str]] = None,
-    force_token_refresh: bool = False,
-) -> Tuple[
-    List[Dict[str, Any]], str, Dict[str, str], Dict[str, List[ModelResult]], int
+) -> Optional[
+    Tuple[List[Dict[str, Any]], str, Dict[str, str], Dict[str, List[ModelResult]], int]
 ]:
     """
     :param stub: the SparseZoo stub path to the model (optionally
@@ -122,24 +132,84 @@ def load_files_from_stub(
     params = None
     if isinstance(stub, str):
         stub, params = parse_zoo_stub(stub=stub, valid_params=valid_params)
-    _LOGGER.debug(f"load_files_from_stub: loading files from {stub}")
-    response = download_get_request(
-        args=stub,
-        force_token_refresh=force_token_refresh,
+    _LOGGER.debug(f"load_files_from_stub: calling  files from {stub}")
+
+    arguments = get_model_metadata_from_stub(stub)
+
+    api = GraphQLAPI()
+
+    models = api.fetch(
+        operation_body="models",
+        arguments=arguments,
+        fields=[
+            "model_id",
+            "model_onnx_size_compressed_bytes",
+            "files(version: 2)",
+            "benchmark_results",
+            "training_results",
+            "repo_name",
+            "repo_namespace",
+        ],
     )
 
-    # piece of code required for backwards compatibility
-    model_response = response.get("model", {})
-    files = model_response.get("files", [])
-    files = restructure_request_json(request_json=files)
-    compressed_file_size = _get_compressed_size(files=files)
-    model_id = model_response.get("model_id")
-    if params is not None:
-        files = filter_files(files=files, params=params)
+    matching_models = len(models)
+    if matching_models == 0:
+        raise ValueError(
+            f"No matching models found with stub: {stub}. Please try another stub"
+        )
+    if matching_models > 1:
+        _LOGGER.warning(
+            f"{len(models)} found from the stub: {stub}."
+            " Using the first model to obtain metadata."
+            " Proceed with caution..."
+        )
 
-    model_results = model_response.get("results")
-    validation_results = _parse_validation_metrics(model_results_response=model_results)
-    return files, model_id, params, validation_results, compressed_file_size
+    if matching_models:
+        model = models[0]
+
+        model_id = model["model_id"]
+
+        files = model.get("files")
+        if len(files) == 0:
+            raise ValueError(f"No files found for stub {stub}")
+
+        include_file_download_url(files)
+        files = restructure_request_json(request_json=files)
+        if params is not None:
+            files = filter_files(files=files, params=params)
+
+        training_results = model.get("training_results")
+
+        benchmark_results = model.get("benchmark_results")
+
+        model_onnx_size_compressed_bytes = model.get("model_onnx_size_compressed_bytes")
+
+        repo_namespace = model.get("repo_namespace")
+        repo_name = model.get("repo_name")
+
+        throughput_results = [
+            ThroughputResults(**benchmark_result)
+            for benchmark_result in benchmark_results
+        ]
+        validation_results = [
+            ValidationResult(**training_result) for training_result in training_results
+        ]
+
+        results: Dict[str, List[ModelResult]] = defaultdict(list)
+        results["validation"] = validation_results
+        results["throughput"] = throughput_results
+
+        return (
+            files,
+            model_id,
+            params,
+            results,
+            model_onnx_size_compressed_bytes,
+            repo_name,
+            repo_namespace,
+        )
+
+    _LOGGER.warning(f"load_files_from_stub: No models found with the stub:{stub}")
 
 
 def filter_files(
@@ -176,17 +246,17 @@ def filter_files(
         raise ValueError("No files found - the list of files is empty!")
 
     if num_recipe_file_dicts >= 2:
-        recipe_names = [
-            file_dict["display_name"]
-            for file_dict in files_filtered
-            if file_dict["file_type"] == "recipe"
-        ]
-        raise ValueError(
-            f"Found multiple recipes: {recipe_names}, "
-            f"for the string argument {expected_recipe_name}"
-        )
-    else:
-        return files_filtered
+        recipe_names = set()
+        for file_dict in files_filtered:
+            if file_dict["file_type"] == "recipe":
+                recipe_names.add(file_dict["display_name"])
+        if len(recipe_names) > 1:
+            raise ValueError(
+                f"Found multiple recipes: {recipe_names}, "
+                f"for the string argument {expected_recipe_name}"
+            )
+
+    return files_filtered
 
 
 def parse_zoo_stub(
@@ -242,7 +312,7 @@ def save_outputs_to_tar(
 
     path = os.path.join(
         os.path.dirname(sample_inputs.path),
-        f"sample_outputs_{engine_type}",
+        f"sample-outputs_{engine_type}",
     )
     if not os.path.exists(path):
         os.mkdir(path)
@@ -276,6 +346,7 @@ def restructure_request_json(
         that will not be filtered out during restructuring
     :return: restructured files
     """
+
     # create `training` folder
     training_dicts_list = fetch_from_request_json(
         request_json, "file_type", "framework"
@@ -288,6 +359,7 @@ def restructure_request_json(
     onnx_model_dict_list = fetch_from_request_json(
         request_json, "display_name", "model.onnx"
     )
+    onnx_model_dict_list = [onnx_model_dict_list[0]]
     assert len(onnx_model_dict_list) == 1
     _, onnx_model_file_dict = copy.copy(onnx_model_dict_list[0])
     onnx_model_file_dict["file_type"] = "deployment"
@@ -315,28 +387,17 @@ def restructure_request_json(
             file_dict_deployment["file_type"] = "deployment"
             request_json.append(file_dict_deployment)
 
-    # create recipes
-    recipe_dicts_list = fetch_from_request_json(request_json, "file_type", "recipe")
-    for (idx, file_dict) in recipe_dicts_list:
-        display_name = file_dict["display_name"]
-        # make sure that recipe name has a
-        # format `recipe_{...}`.
-        prefix = "recipe_"
-        if not display_name.startswith(prefix):
-            display_name = prefix + display_name
-            file_dict["display_name"] = display_name
-            request_json[idx] = file_dict
-
     # restructure inputs/labels/originals/outputs directories
     # use `sample-inputs.tar.gz` to simulate non-existent directories
 
     files_to_create = [
-        "sample_inputs.tar.gz",
-        "sample_labels.tar.gz",
-        "sample_originals.tar.gz",
-        "sample_outputs.tar.gz",
+        "deployment.tar.gz",
+        "sample-inputs.tar.gz",
+        "sample-labels.tar.gz",
+        "sample-originals.tar.gz",
+        "sample-outputs.tar.gz",
     ]
-    types = ["inputs", "labels", "originals", "outputs"]
+    types = ["deployment", "inputs", "labels", "originals", "outputs"]
     for file_name, type in zip(files_to_create, types):
         data = fetch_from_request_json(
             request_json, "display_name", file_name.replace("_", "-")
@@ -441,7 +502,7 @@ def setup_model(
     # iterate over the arguments (files)
     for name, file in files_dict.items():
         if file is None:
-            logging.debug(f"File {name} not provided. It will be omitted.")
+            _LOGGER.debug(f"File {name} not provided. It will be omitted.")
         else:
             if isinstance(file, str):
                 # if file is a string, convert it to
@@ -505,10 +566,26 @@ def _copy_file_contents(
             _copy_and_overwrite(file.path, copy_path, shutil.copytree)
     else:
         # for the structured directories/files
-        if isinstance(file, list):
-            for _file in file:
+        if isinstance(file, Recipes):
+            for _file in file.recipes:
                 copy_path = os.path.join(output_dir, os.path.basename(_file.path))
                 _copy_and_overwrite(_file.path, copy_path, shutil.copyfile)
+        elif isinstance(file, OnnxGz):
+            # download and unzip model.onnx.tar.gz
+            model_gz_path = Path(file.path).with_name("model.onnx.tar.gz")
+
+            # copy all contents of unzipped model.onnx.tar.gz file to
+            #  top level of output
+            for name in tarfile.open(model_gz_path).getnames():
+                unzipped_file_path = model_gz_path.with_name(name)
+                copy_location = Path(output_dir) / name
+                _copy_and_overwrite(
+                    str(unzipped_file_path), str(copy_location), shutil.copyfile
+                )
+            # copy the model.onnx.tar.gz file to the top level of output
+            tar_copy_path = Path(output_dir) / model_gz_path.name
+            _copy_and_overwrite(str(model_gz_path), str(tar_copy_path), shutil.copyfile)
+
         elif isinstance(file, Directory):
             copy_path = os.path.join(output_dir, os.path.basename(file.path))
             _copy_and_overwrite(file.path, copy_path, shutil.copytree)
@@ -524,33 +601,51 @@ def _copy_and_overwrite(from_path, to_path, func):
     func(from_path, to_path)
 
 
-def _parse_validation_metrics(
-    model_results_response: List[Dict[str, Union[str, float, int]]]
-) -> Dict[str, List[ModelResult]]:
-    results: Dict[str, List[ModelResult]] = defaultdict(list)
-    for result in model_results_response:
-        recorded_units = result.get("recorded_units").lower()
-        if recorded_units in ["items/seconds", "items/second"]:
-            key = "throughput"
-            current_result = ThroughputResults(
-                result_type=result.get("result_type"),
-                recorded_value=result.get("recorded_value"),
-                recorded_units=result.get("recorded_units"),
-                device_info=result.get("device_info"),
-                num_cores=result.get("num_cores"),
-                batch_size=result.get("batch_size"),
-            )
+def include_file_download_url(files: List[Dict]):
+    for file in files:
+        file["url"] = get_file_download_url(file["download_url"])
+        del file["download_url"]
 
-        else:
-            current_result = ValidationResult(
-                result_type=result.get("result_type"),
-                recorded_value=result.get("recorded_value"),
-                recorded_units=recorded_units,
-                dataset_name=result.get("dataset_name"),
-                dataset_type=result.get("dataset_type"),
-            )
-            key = "validation"
 
-        results[key].append(current_result)
+def get_model_metadata_from_stub(stub: str) -> Dict[str, str]:
+    """Return a dictionary of the model metadata from stub"""
 
-    return results
+    matches = re.match(STUB_V1_REGEX_EXPR, stub) or re.match(STUB_V2_REGEX_EXPR, stub)
+    if not matches:
+        return {}
+
+    if "source_dataset" in matches.groupdict():
+        return {"repo_name": stub}
+
+    if "dataset" in matches.groupdict():
+        return {
+            "domain": matches.group("domain"),
+            "sub_domain": matches.group("sub_domain"),
+            "architecture": matches.group("architecture"),
+            "sub_architecture": matches.group("sub_architecture"),
+            "framework": matches.group("framework"),
+            "repo": matches.group("repo"),
+            "dataset": matches.group("dataset"),
+            "sparse_tag": matches.group("sparse_tag"),
+        }
+
+    return {}
+
+
+def is_stub(candidate: str) -> bool:
+    return bool(
+        re.match(STUB_V1_REGEX_EXPR, candidate)
+        or re.match(STUB_V2_REGEX_EXPR, candidate)
+    )
+
+
+def get_file_download_url(
+    download_url: str,
+):
+    """Url to download a file"""
+    # important, do not remove
+    if convert_to_bool(os.getenv("SPARSEZOO_TEST_MODE")):
+        delimiter = "&" if "?" in download_url else "?"
+        download_url += f"{delimiter}increment_download=False"
+
+    return download_url

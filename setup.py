@@ -30,6 +30,7 @@ from setuptools import find_packages, setup
 
 # default variables to be overwritten by the version.py file
 is_release = None
+is_dev = None
 version = "unknown"
 version_base = version
 
@@ -37,17 +38,26 @@ version_base = version
 exec(open(os.path.join("src", "sparsezoo", "version.py")).read())
 print(f"loaded version {version} from src/sparsezoo/version.py")
 
-_PACKAGE_NAME = "sparsezoo" if is_release else "sparsezoo-nightly"
+if is_release:
+    _PACKAGE_NAME = "sparsezoo"
+elif is_dev:
+    _PACKAGE_NAME = "sparsezoo-dev"
+else:
+    _PACKAGE_NAME = "sparsezoo-nightly"
 
 _deps = [
-    "numpy>=1.0.0,<=1.21.6",
-    "onnx>=1.5.0,<=1.12.0",
+    "numpy>=1.17.0,<2.0",
+    "onnx>=1.5.0,<1.15.0",
     "pyyaml>=5.1.0",
     "requests>=2.0.0",
     "tqdm>=4.0.0",
-    "pydantic>=1.8.2",
+    "pydantic~=2.0",
     "click>=7.1.2,!=8.0.0",  # latest version < 8.0 + blocked version with reported bug
-    "protobuf>=3.12.2,<4",
+    "protobuf>=3.12.2",
+    "pandas>1.3",
+    "py-machineid>=0.3.0",
+    "geocoder>=1.38.0",
+    "onnxruntime>=1.0.0",
 ]
 _notebook_deps = ["ipywidgets>=7.0.0", "jupyter>=1.0.0"]
 
@@ -55,8 +65,13 @@ _dev_deps = [
     "beautifulsoup4==4.9.3",
     "black==22.12.0",
     "flake8>=3.8.3",
-    "flaky>=3.7.0",
     "isort>=5.7.0",
+    "pytest>=6.0.0",
+    "wheel>=0.36.2",
+    "matplotlib>=3.0.0",
+]
+
+_docs_deps = [
     "m2r2~=0.2.7",
     "mistune==0.8.4",
     "myst-parser~=0.14.0",
@@ -65,11 +80,7 @@ _dev_deps = [
     "sphinx-copybutton>=0.3.0",
     "sphinx-markdown-tables>=0.0.15",
     "sphinx-multiversion==0.2.4",
-    "pytest>=6.0.0",
     "sphinx-rtd-theme",
-    "wheel>=0.36.2",
-    "onnxruntime>=1.0.0",
-    "matplotlib>=3.0.0",
 ]
 
 
@@ -84,7 +95,7 @@ def _setup_install_requires() -> List:
 
 
 def _setup_extras() -> Dict:
-    return {"dev": _dev_deps, "nb": _notebook_deps}
+    return {"dev": _dev_deps, "nb": _notebook_deps, "docs": _docs_deps}
 
 
 def _setup_entry_points() -> Dict:
@@ -92,6 +103,8 @@ def _setup_entry_points() -> Dict:
         "console_scripts": [
             "sparsezoo=sparsezoo.main:main",
             "sparsezoo.download=sparsezoo.download_main:main",
+            "sparsezoo.analyze=sparsezoo.analyze_cli:main",
+            "sparsezoo.deployment_package=sparsezoo.deployment_package.cli:main",
         ]
     }
 
@@ -124,15 +137,15 @@ setup(
     install_requires=_setup_install_requires(),
     extras_require=_setup_extras(),
     entry_points=_setup_entry_points(),
-    python_requires=">=3.7.0",
+    python_requires=">=3.8.0",
     classifiers=[
         "Development Status :: 5 - Production/Stable",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3 :: Only",
-        "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
         "Intended Audience :: Developers",
         "Intended Audience :: Education",
         "Intended Audience :: Information Technology",

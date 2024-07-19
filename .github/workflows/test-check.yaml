@@ -34,6 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SPARSEZOO_TEST_MODE: "true"
+      NM_DISABLE_ANALYTICS: "true"
     needs: test-setup
     if: ${{needs.test-setup.outputs.python-diff == 1}}
     steps:
@@ -42,12 +43,11 @@ jobs:
         run: pip3 install .[dev]
       - name: "🔬 Running tests"
         run: make test
-        env:
-          SPARSEZOO_API_URL: https://staging-api.neuralmagic.com
   extensive-python-tests:
     runs-on: ubuntu-latest
     env:
       SPARSEZOO_TEST_MODE: "true"
+      NM_DISABLE_ANALYTICS: "true"
     needs: test-setup
     if: ${{needs.test-setup.outputs.full-check == 1}}
     steps:

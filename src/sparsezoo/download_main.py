@@ -46,6 +46,7 @@ import argparse
 import logging
 
 from sparsezoo import Model
+from sparsezoo.analytics import sparsezoo_analytics
 
 
 __all__ = ["main"]
@@ -61,8 +62,7 @@ def parse_args():
     parser.add_argument(
         "model_stub",
         type=str,
-        help="Path to a SparseZoo model stub i.e. "
-        "zoo:cv/classification/resnet_v1-50/pytorch/sparseml/imagenet/pruned-moderate",
+        help="Path to a SparseZoo model stub i.e. " "zoo:opt-1.3b-opt_pretrain-base",
     )
 
     parser.add_argument(
@@ -76,6 +76,7 @@ def parse_args():
     return parser.parse_args()
 
 
+@sparsezoo_analytics.send_event_decorator("cli__download")
 def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO)

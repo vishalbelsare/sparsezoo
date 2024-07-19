@@ -170,7 +170,8 @@ sparsezoo download --domain cv --sub-domain classification --architecture mobile
 import argparse
 import logging
 
-from sparsezoo import Model, model_args_to_stub, search_models
+from sparsezoo import Model, search_models
+from sparsezoo.analytics import sparsezoo_analytics
 
 
 __all__ = ["main"]
@@ -280,7 +281,12 @@ def parse_args():
         SEARCH_COMMAND,
         description="Search for objects from the repo.",
     )
-    add_model_arguments(download_parser, download_required=True)
+
+    download_parser.add_argument(
+        "stub",
+        help="Model stub. Please visit sparsezoo.neuralmagic.com to obtain",
+    )
+
     add_model_arguments(search_parser)
 
     download_parser.add_argument(
@@ -365,26 +371,15 @@ def search(args):
         print("-------------------------")
 
 
+@sparsezoo_analytics.send_event_decorator("cli__main")
 def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO)
 
     if args.command == DOWNLOAD_COMMAND:
         LOGGER.info("Downloading files from model...")
-        stub = model_args_to_stub(
-            domain=args.domain,
-            sub_domain=args.sub_domain,
-            architecture=args.architecture,
-            sub_architecture=args.sub_architecture,
-            framework=args.framework,
-            repo=args.repo,
-            dataset=args.dataset,
-            training_scheme=args.training_scheme,
-            sparse_name=args.sparse_name,
-            sparse_category=args.sparse_category,
-            sparse_target=args.sparse_target,
-            release_version=args.release_version,
-        )
+
+        stub = args.stub
 
         if args.save_dir:
             model = Model(stub, download_path=args.save_dir)

@@ -20,12 +20,14 @@ import time
 import traceback
 from typing import Dict, List, Optional, Union
 
-from sparsezoo import utils
+from sparsezoo.utils import download_file
 
 from .file import File
 
 
 __all__ = ["Directory", "is_directory"]
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class Directory(File):
@@ -39,6 +41,8 @@ class Directory(File):
     :param path: path of the Directory
     :param url: url of the Directory
     :param parent_directory: path of the parent Directory
+    :param force: boolean flag; True to force unzipping of archive files.
+        Default is False.
     """
 
     def __init__(
@@ -48,6 +52,7 @@ class Directory(File):
         path: Optional[str] = None,
         url: Optional[str] = None,
         parent_directory: Optional[str] = None,
+        force: bool = False,
     ):
 
         self.files = (
@@ -60,8 +65,8 @@ class Directory(File):
             name=name, path=path, url=url, parent_directory=parent_directory
         )
 
-        if self._unpack():
-            self.unzip()
+        if self._unpack() or force:
+            self.unzip(force=force)
 
     @classmethod
     def from_file(cls, file: File) -> "Directory":
@@ -131,7 +136,7 @@ class Directory(File):
         if is_valid:
             return True
         else:
-            logging.warning(
+            _LOGGER.warning(
                 "Following files: "
                 f"{[key for key, value in validations.items() if not value]} "
                 "were not successfully validated."
@@ -163,39 +168,47 @@ class Directory(File):
                     "Please make sure that `destination_path` argument is not None."
                 )
 
+        # If tar_directory is not None, then we are downloading
+        # the directory as a tar archive file
+        target_directory = (
+            self if getattr(self, "tar_directory", None) is None else self.tar_directory
+        )
+
         # Directory can represent a tar file.
-        if self.is_archive:
-            new_file_path = os.path.join(destination_path, self.name)
+        # In this case, we download the tar file and unzip it.
+        if target_directory.is_archive:
+            new_file_path = os.path.join(destination_path, target_directory.name)
             for attempt in range(retries):
                 try:
-                    utils.download_file(
-                        url_path=self.url,
+                    download_file(
+                        url_path=target_directory.url,
                         dest_path=new_file_path,
                         overwrite=overwrite,
                     )
 
-                    self._path = new_file_path
+                    target_directory._path = new_file_path
+                    target_directory.unzip()
                     return
 
                 except Exception as err:
-                    logging.error(err)
-                    logging.error(traceback.format_exc())
+                    _LOGGER.error(err)
+                    _LOGGER.error(traceback.format_exc())
                     time.sleep(retry_sleep_sec)
-                logging.error(
-                    f"Trying attempt {attempt + 1} of {retries}.", attempt + 1, retries
-                )
-            logging.error("Download retry failed...")
+                _LOGGER.error(f"Trying attempt {attempt + 1} of {retries}.")
+            _LOGGER.error("Download retry failed...")
             raise Exception("Exceed max retry attempts: {} failed".format(retries))
 
         # Directory can represent a folder or directory.
         else:
-            for file in self.files:
+            for file in target_directory.files:
                 file.download(
-                    destination_path=os.path.join(destination_path, self.name)
+                    destination_path=destination_path,
                 )
-                file._path = os.path.join(destination_path, self.name, file.name)
+                file._path = os.path.join(
+                    destination_path, target_directory.name, file.name
+                )
 
-        self._path = os.path.join(destination_path, self.name)
+        target_directory._path = os.path.join(destination_path, target_directory.name)
 
     def get_file(self, file_name: str) -> Optional[File]:
         """
@@ -207,7 +220,9 @@ class Directory(File):
         :return: File if found, otherwise None
         """
         for file in self.files:
-            if file.name == file_name:
+            if file is None:
+                continue
+            if os.path.basename(file.name) == file_name:
                 return file
             if isinstance(file, Directory):
                 file = file.get_file(file_name=file_name)
@@ -254,7 +269,7 @@ class Directory(File):
         self._path = tar_file_path
         self.is_archive = True
 
-    def unzip(self, extract_directory: Optional[str] = None):
+    def unzip(self, extract_directory: Optional[str] = None, force: bool = False):
         """
         Extracts a tar archive Directory.
         The extracted files would be saved in the parent directory of
@@ -262,10 +277,15 @@ class Directory(File):
 
         :param extract_directory: the local path to create
             folder Directory at (default = None)
+        :param force: if True, will always unzip, even if the target directory
+            already exists. Default False
         """
+        if self._path is None:
+            # use path property to download so path exists
+            self._path = self.path
         files = []
         if extract_directory is None:
-            extract_directory = os.path.dirname(self.path)
+            extract_directory = os.path.dirname(self._path)
 
         if not self.is_archive:
             raise ValueError(
@@ -274,14 +294,36 @@ class Directory(File):
             )
 
         name = ".".join(self.name.split(".")[:-2])
-        tar = tarfile.open(self.path, "r")
-        path = os.path.join(extract_directory, name)
-
-        for member in tar.getmembers():
-            member.name = os.path.basename(member.name)
-            tar.extract(member=member, path=path)
-            files.append(File(name=member.name, path=os.path.join(path, member.name)))
-        tar.close()
+        is_model_gz = name == "model.onnx"
+        path = (
+            extract_directory if is_model_gz else os.path.join(extract_directory, name)
+        )
+        # if is_model_gz then path would point to the tarfile(s)
+        # parent directory and must be unzipped irrespective of existence
+        if (
+            is_model_gz or not os.path.exists(path) or force
+        ):  # do not re-unzip if not forced
+            tar = tarfile.open(self._path, "r")
+            for member in tar.getmembers():
+                member.name = os.path.basename(member.name)
+                tar.extract(member=member, path=path)
+                files.append(
+                    File(
+                        name=member.name,
+                        path=os.path.join(path, member.name),
+                        parent_directory=path,
+                    )
+                )
+            tar.close()
+        # if path already exists, then the tar archive has already been unzipped
+        # and we can just use the files in the directory
+        elif os.path.exists(path):
+            for file in os.listdir(path):
+                files.append(
+                    File(
+                        name=file, path=os.path.join(path, file), parent_directory=path
+                    )
+                )
 
         self.name = name
         self.files = files
@@ -327,7 +369,7 @@ def is_directory(file: File) -> bool:
 def _possibly_convert_files_to_directories(files: List[File]) -> List[File]:
     return [
         Directory.from_file(file)
-        if (is_directory(file) and not isinstance(file, Directory))
+        if not isinstance(file, Directory) and is_directory(file)
         else file
         for file in files
     ]

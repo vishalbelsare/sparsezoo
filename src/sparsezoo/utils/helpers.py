@@ -13,8 +13,12 @@
 # limitations under the License.
 
 import glob
+import importlib
+import logging
 import os
-from typing import Any
+import re
+from contextlib import contextmanager
+from typing import Any, Type
 
 
 __all__ = [
@@ -23,6 +27,8 @@ __all__ = [
     "clean_path",
     "remove_tar_duplicates",
     "convert_to_bool",
+    "disable_request_logs",
+    "import_from_path",
 ]
 
 
@@ -87,3 +93,46 @@ def clean_path(path: str) -> str:
     :return: a cleaned version that expands the user path and creates an absolute path
     """
     return os.path.abspath(os.path.expanduser(path))
+
+
+@contextmanager
+def disable_request_logs():
+    """
+    Context manager for disabling logs for a requests session
+    """
+    loggers = [logging.getLogger("requests"), logging.getLogger("urllib3")]
+
+    original_disabled_states = [logger.disabled for logger in loggers]
+    for logger in loggers:
+        logger.disabled = True
+
+    yield
+
+    for logger, original_disabled_state in zip(loggers, original_disabled_states):
+        logger.disabled = original_disabled_state
+
+
+def import_from_path(path: str) -> Type[Any]:
+    """
+    Import the module and the name of the function/class separated by :
+    Examples:
+      path = "/path/to/file.py:func_or_class_name"
+      path = "/path/to/file:focn"
+      path = "path.to.file:focn"
+    :param path: path including the file path and object name
+    :return Function or class object
+    """
+    original_path, class_name = path.split(":")
+    _path = original_path
+
+    path = original_path.split(".py")[0]
+    path = re.sub(r"/+", ".", path)
+    try:
+        module = importlib.import_module(path)
+    except ImportError:
+        raise ImportError(f"Cannot find module with path {_path}")
+
+    try:
+        return getattr(module, class_name)
+    except AttributeError:
+        raise AttributeError(f"Cannot find {class_name} in {_path}")

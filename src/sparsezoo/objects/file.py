@@ -29,6 +29,8 @@ from sparsezoo.utils import download_file, load_numpy_list
 
 __all__ = ["File"]
 
+_LOGGER = logging.getLogger(__name__)
+
 
 class File:
     """
@@ -93,7 +95,7 @@ class File:
         elif not os.path.exists(self._path):
             self.download()
 
-        return self._path
+        return self._path or self.path
 
     @classmethod
     def from_dict(
@@ -149,7 +151,7 @@ class File:
             )
 
         if self._path is not None:
-            logging.warning(
+            _LOGGER.warning(
                 f"Overwriting the current location of the File: {self._path} "
                 f"with the new location: {new_file_path}."
             )
@@ -165,13 +167,11 @@ class File:
                 return
 
             except Exception as err:
-                logging.error(err)
-                logging.error(traceback.format_exc())
+                _LOGGER.error(err)
+                _LOGGER.error(traceback.format_exc())
                 time.sleep(retry_sleep_sec)
-            logging.error(
-                f"Trying attempt {attempt + 1} of {retries}.", attempt + 1, retries
-            )
-        logging.error("Download retry failed...")
+            _LOGGER.error(f"Trying attempt {attempt + 1} of {retries}.")
+        _LOGGER.error("Download retry failed...")
         raise Exception("Exceed max retry attempts: {} failed".format(retries))
 
     def validate(self, strict_mode: bool = True) -> bool:
@@ -185,7 +185,7 @@ class File:
         :return: boolean flag; True if File instance is loadable, otherwise False
         """
         if not self.name or (not self._path and not self.url):
-            logging.warning(
+            _LOGGER.warning(
                 "Failed to validate a file. A valid file needs to "
                 "have a valid `name` AND a valid `path` or `url`."
             )
@@ -256,7 +256,7 @@ class File:
             return yaml_dict
 
         except Exception as error:  # noqa: F841
-            logging.debug(error)
+            _LOGGER.debug(error)
 
     def _validate_markdown(self, strict_mode):
         # test if .md file is a model_card
@@ -318,4 +318,4 @@ class File:
         if strict_mode:
             raise ValueError(error_msg)
         else:
-            logging.warning(error_msg)
+            _LOGGER.warning(error_msg)
